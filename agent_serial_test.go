@@ -137,6 +137,9 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(fmt.Sprintf(`the viam-agent systemd unit is running with %s$`, versionGroup), testAgentRunningWithVersion)
 	ctx.Step(fmt.Sprintf(`the viam-agent systemd unit started with %s`, versionGroup), testSystemdAgentStartVersion)
 	ctx.Step(fmt.Sprintf(`viam-agent is pinned to %s`, versionGroup), applyAgentVersionPin)
+	ctx.Step(`the viam-agent systemd unit is dead$`, testAgentDead)
+	ctx.Step(`the viam-agent systemd unit is not found$`, testAgentNotFound)
+	ctx.Step(`all viam files have been removed`, testViamFilesRemoved)
 }
 
 func removeViam(ctx context.Context) (context.Context, error) {
@@ -172,6 +175,14 @@ func testAgentEnabled(ctx context.Context) (context.Context, error) {
 
 func testAgentRunning(ctx context.Context) (context.Context, error) {
 	return testAgentState(ctx, "SubState", "running")
+}
+
+func testAgentDead(ctx context.Context) (context.Context, error) {
+	return testAgentState(ctx, "SubState", "dead")
+}
+
+func testAgentNotFound(ctx context.Context) (context.Context, error) {
+	return testAgentState(ctx, "LoadState", "not-found")
 }
 
 func testAgentRunningWithVersion(ctx context.Context, version string) (context.Context, error) {
