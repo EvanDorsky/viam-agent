@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"time"
 
 	errw "github.com/pkg/errors"
@@ -48,16 +49,22 @@ func (n *Subsystem) startWeb(bindAddr string, bindPort int) error {
 	mux.HandleFunc("/", n.portalIndex)
 	mux.HandleFunc("/save", n.portalSave)
 
-	n.dataMu.Lock()
-	n.webServer = &http.Server{
+	srv := &http.Server{
 		Handler:     mux,
 		ReadTimeout: time.Second * 10,
 	}
+	n.dataMu.Lock()
+	n.webServer = srv
 	n.dataMu.Unlock()
 	bind := net.JoinHostPort(bindAddr, strconv.Itoa(bindPort))
 	//nolint: noctx
 	lis, err := net.Listen("tcp", bind)
 	if err != nil {
+		if errors.Is(err, syscall.EADDRINUSE) {
+			return errw.Wrapf(err, "cannot bind %s: another service is already using this port. "+
+				"Stop it or scope its listen address away from %s (find it with: ss -ltnp | grep :%d)",
+				bind, bindAddr, bindPort)
+		}
 		return errw.Wrapf(err, "listening on: %s", bind)
 	}
 
@@ -67,11 +74,11 @@ func (n *Subsystem) startWeb(bindAddr string, bindPort int) error {
 			n.logger.Warnw("stopping provisioning, panic in web goroutine",
 				"panic", panickedWith)
 			if err := n.stopProvisioning(); err != nil {
-				n.logger.Warnw("failed to stop provisioning", "err", err)
+				n.logger.Warnw("failed to stop provisioning", "err", err.Error())
 			}
 		})
 		defer n.portalData.workers.Done()
-		err := n.webServer.Serve(lis)
+		err := srv.Serve(lis)
 		if !errors.Is(err, http.ErrServerClosed) {
 			n.logger.Warn(err)
 		}
@@ -80,13 +87,18 @@ func (n *Subsystem) startWeb(bindAddr string, bindPort int) error {
 }
 
 func (n *Subsystem) stopPortal() error {
-	if n.grpcServer != nil {
-		n.grpcServer.Stop()
-		n.grpcServer = nil
-	}
+	n.dataMu.Lock()
+	grpcSrv := n.grpcServer
+	webSrv := n.webServer
+	n.grpcServer = nil
+	n.webServer = nil
+	n.dataMu.Unlock()
 
-	if n.webServer != nil {
-		return n.webServer.Close()
+	if grpcSrv != nil {
+		grpcSrv.Stop()
+	}
+	if webSrv != nil {
+		return webSrv.Close()
 	}
 	return nil
 }

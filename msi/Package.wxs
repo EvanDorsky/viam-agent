@@ -14,12 +14,28 @@
 
     <Launch Condition="Privileged" Message="This installer requires administrator privileges." />
 
+    <!-- Sets VIAMJSONPRESENT if [CONFIGDIR]\viam.json exists. AppSearch runs before the first
+         dialog. The search path expands [CONFIGDIR], so a CONFIGDIR= override is honored. -->
+    <Property Id="VIAMJSONPRESENT">
+      <DirectorySearch Id="ConfigDirSearch" Path="[CONFIGDIR]">
+        <FileSearch Id="ViamJsonSearch" Name="viam.json" />
+      </DirectorySearch>
+    </Property>
+
+    <!-- Pass FORCEINSTALL=1 to skip the missing-config hard-fail. Secure so it reaches the
+         execute sequence. -->
+    <Property Id="FORCEINSTALL" Secure="yes" />
+
+    <!-- Aborts the install with this message. Fired from InstallExecuteSequence for silent installs;
+         text is formatted, so [CONFIGDIR] resolves. -->
+    <CustomAction Id="ViamJsonMissingError"
+                  Error="Viam Agent requires a machine config at [CONFIGDIR]\viam.json, but none was found. Download your machine's viam.json from app.viam.com and place it at [CONFIGDIR]\viam.json, then run this installer again. To install anyway (the service will not start until the config is present), re-run with FORCEINSTALL=1." />
+
     <MajorUpgrade DowngradeErrorMessage="A newer version of Viam Agent is already installed." />
 
     <MediaTemplate EmbedCab="yes" />
 
     <!-- These can be overridden in CLI with: `installer.msi SERVICEACCOUNT=1` -->
-    <Property Id="AGENTDOWNLOADURL" Value="https://storage.googleapis.com/packages.viam.com/apps/viam-agent/viam-agent-stable-windows-x86_64" />
     <Property Id="SERVICEACCOUNT" Secure="yes" />
     <!-- if you change default rootdir, also change the conditional on SetViamHomeEnv -->
     <Property Id="ROOTDIR" Value="C:\opt\viam" />
@@ -38,7 +54,10 @@
 
     <ComponentGroup Id="AgentCache" Directory="CACHEDIR">
       <Component Id="CacheDir" Guid="01A2E465-CBC5-4807-BE48-F7791C3B7EF7">
-        <CreateFolder />
+        <File Id="AgentCacheExe"
+              Source="viam-agent-from-installer.exe"
+              Name="viam-agent-from-installer.exe"
+              KeyPath="yes" />
       </Component>
     </ComponentGroup>
 
@@ -48,18 +67,6 @@
       - Wix4UtilCA_X64 / WixQuietExec run with the SYSTEM privilege of the elevated msi process, rather than the default of running custom actions in an MSI sandbox
       - see https://docs.firegiant.com/wix/tools/wixext/quietexec/#quiet-running-as-deferred-custom-actions
     -->
-
-    <SetProperty Id="DownloadAgent"
-                 Before="DownloadAgent"
-                 Sequence="execute"
-                 Value="&quot;[System64Folder]curl.exe&quot; -L --fail --retry 3 -o &quot;[CACHEDIR]viam-agent-from-installer.exe&quot; &quot;[AGENTDOWNLOADURL]&quot;" />
-
-    <CustomAction Id="DownloadAgent"
-                  Execute="deferred"
-                  Impersonate="no"
-                  Return="check"
-                  BinaryRef="Wix4UtilCA_X64"
-                  DllEntry="WixQuietExec64" />
 
     <SetProperty Id="CreateSymlink"
                  Before="CreateSymlink"
@@ -178,8 +185,10 @@
                   DllEntry="WixQuietExec64" />
 
     <InstallExecuteSequence>
-      <Custom Action="DownloadAgent" After="CreateFolders"
-              Condition="NOT REMOVE" />
+      <!-- Hard-fail silent installs missing viam.json, unless FORCEINSTALL=1. GUI installs set
+           VIAMJSONACK at the warning page, so they're excluded. -->
+      <Custom Action="ViamJsonMissingError" Before="InstallInitialize"
+              Condition="NOT VIAMJSONPRESENT AND NOT VIAMJSONACK AND NOT FORCEINSTALL AND NOT Installed AND NOT REMOVE" />
       <Custom Action="CreateSymlink" After="InstallFiles"
               Condition="NOT REMOVE" />
       <Custom Action="ConfigureServiceFailureFlag" After="InstallServices"
@@ -297,7 +306,7 @@
                  Text="Run as virtual service account (NT SERVICE\viam-agent)" />
         <Control Id="ServiceAccountDesc" Type="Text"
                  X="35" Y="88" Width="315" Height="50" NoPrefix="yes"
-                 Text="When checked, the service runs with minimal privileges using a virtual service account. Recommended for production deployments. When unchecked, the service runs as Local System." />
+                 Text="(Advanced user option. Not recommended for production deployments.)&#10;&#10;If checked, the service runs with minimal privileges using a virtual service account. If unchecked, the service runs as Local System." />
 
         <!-- Bottom bar -->
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
@@ -311,10 +320,52 @@
         </Control>
       </Dialog>
 
+      <!-- Warning page shown between Welcome and InstallDir only when viam.json is missing (see
+           navigation below). Next sets VIAMJSONACK=1, which advances and exempts GUI installs from
+           the hard-fail. -->
+      <Dialog Id="ViamJsonWarnDlg" Width="370" Height="270"
+              Title="!(loc.InstallDirDlg_Title)">
+        <!-- Banner area (matches WixUI standard layout) -->
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44"
+                 TabSkip="no" Text="!(loc.InstallDirDlgBannerBitmap)" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="280" Height="15"
+                 Transparent="yes" NoPrefix="yes"
+                 Text="{\WixUI_Font_Title}Machine config not found" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="320" Height="15"
+                 Transparent="yes" NoPrefix="yes"
+                 Text="No viam.json was found at the expected location." />
+
+        <!-- Body -->
+        <Control Id="WarnText" Type="Text" X="20" Y="60" Width="330" Height="120" NoPrefix="yes"
+                 Text="No machine config was found at [CONFIGDIR]\viam.json.&#10;&#10;You can continue, but the Viam Agent service will not start until you download your machine's viam.json from app.viam.com and place it at [CONFIGDIR]\viam.json.&#10;&#10;Click Next to install anyway, or Back to cancel and add the config first." />
+
+        <!-- Bottom bar -->
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17"
+                 Default="yes" Text="!(loc.WixUIBack)">
+          <Publish Event="NewDialog" Value="WelcomeDlg" Condition="1" />
+        </Control>
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17"
+                 Text="!(loc.WixUINext)">
+          <Publish Property="VIAMJSONACK" Value="1" Order="1" Condition="1" />
+          <Publish Event="NewDialog" Value="InstallDirDlg" Order="2" Condition="1" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17"
+                 Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
+
+      <!-- Route through the warning page only when viam.json is missing; InstallDir's Back mirrors it. -->
       <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog"
-               Value="InstallDirDlg" Order="10" Condition="1" />
+               Value="ViamJsonWarnDlg" Order="5" Condition="NOT VIAMJSONPRESENT" />
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog"
+               Value="InstallDirDlg" Order="10" Condition="VIAMJSONPRESENT" />
       <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog"
-               Value="WelcomeDlg" Order="10" Condition="1" />
+               Value="ViamJsonWarnDlg" Order="5" Condition="NOT VIAMJSONPRESENT" />
+      <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog"
+               Value="WelcomeDlg" Order="10" Condition="VIAMJSONPRESENT" />
       <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog"
                Value="ServiceAccountDlg" Order="10" Condition="1" />
       <Publish Dialog="ServiceAccountDlg" Control="Back" Event="NewDialog"
@@ -325,7 +376,6 @@
                Value="ServiceAccountDlg" Order="10" Condition="1" />
 
       <!-- messages shown above the progress bar for each step -->
-      <ProgressText Action="DownloadAgent" Message="Downloading Viam Agent binary..." />
       <ProgressText Action="CreateSymlink" Message="Creating viam-agent symlink..." />
       <ProgressText Action="ConfigureServiceFailure" Message="Configuring service failure recovery..." />
       <ProgressText Action="ConfigureServiceFailureFlag" Message="Enabling service failure-on-crash flag..." />

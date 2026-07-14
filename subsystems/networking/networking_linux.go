@@ -46,7 +46,6 @@ type Subsystem struct {
 
 	mainLoopHealth *health
 	bgLoopHealth   *health
-	btHealthy      bool
 
 	// locking for config updates
 	dataMu sync.RWMutex
@@ -57,18 +56,30 @@ type Subsystem struct {
 	webServer  *http.Server
 	grpcServer *grpc.Server
 	portalData *userInputData
+	// inputChan carries credentials from any provisioning channel (BLE, hotspot)
+	// to mainLoop. Owned by Subsystem so BLE writes work before startProvisioning runs.
+	inputChan chan userInput
 
-	// bluetooth
-	noBT       bool
-	btChar     *btCharacteristics
-	btAdv      *bluetooth.Advertisement
-	bleService *bluetooth.Service
-	btAgent    *pairingAgent
+	// visibleNetworks cache, refreshed by backgroundLoop, read by bleLoop.
+	visibleNetworksMu    sync.RWMutex
+	visibleNetworksCache []NetworkInfo
+
+	// bluetooth — ble and backoff fields written exclusively from bleLoop.
+	ble            bleTracker
+	bleNextAttempt time.Time
+	bleBackoff     time.Duration
+	btChar         *btCharacteristics
+	bleService     *bluetooth.Service
+	btAgent        *pairingAgent
 
 	pb.UnimplementedProvisioningServiceServer
 }
 
 func New(ctx context.Context, logger logging.Logger, cfg utils.AgentConfig) *Subsystem {
+	// Route all networking logs through a "networking" sublogger (e.g. "viam-agent.networking")
+	// so that app can treat them as diagnostic rather than user-facing. See diagnosticLoggerNames
+	// in the app repo.
+	logger = logger.Sublogger("networking")
 	subsys := &Subsystem{
 		cfg:    cfg.NetworkConfiguration,
 		nets:   cfg.AdditionalNetworks,
@@ -83,7 +94,12 @@ func New(ctx context.Context, logger logging.Logger, cfg utils.AgentConfig) *Sub
 		mainLoopHealth: &health{},
 		bgLoopHealth:   &health{},
 	}
-	subsys.portalData = &userInputData{connState: subsys.connState}
+	subsys.inputChan = make(chan userInput, 10)
+	subsys.portalData = &userInputData{
+		connState: subsys.connState,
+		input:     &userInput{},
+		inputChan: subsys.inputChan,
+	}
 	subsys.btAgent = &pairingAgent{
 		logger:     logger,
 		networking: subsys,
@@ -262,6 +278,11 @@ func (n *Subsystem) Start(ctx context.Context) error {
 		n.mainLoopHealth.MarkGood()
 		n.bgLoopHealth.MarkGood()
 		go n.mainLoop(cancelCtx)
+
+		if !n.Config().DisableBTProvisioning.Get() {
+			n.monitorWorkers.Add(1)
+			go n.bleLoop(cancelCtx)
+		}
 	} else {
 		n.logger.Warn("Both wifi and bluetooth provisioning have been disabled by configuration. Provisioning will not be available.")
 	}
@@ -358,52 +379,29 @@ func (n *Subsystem) HealthCheck(ctx context.Context) error {
 	}
 	bgLoopHealthy := n.bgLoopHealth.IsHealthy()
 	mainLoopHealthy := n.mainLoopHealth.IsHealthy()
-	btEnabled := n.bluetoothEnabled()
-	btAdvUnset := n.btAdv == nil
-	btHealthy := n.btHealthy
-	wifiOk := bgLoopHealthy && mainLoopHealthy
-	btOk := !btEnabled || btAdvUnset || btHealthy
-	if wifiOk || btOk {
-		if !wifiOk || (btEnabled && !btOk) {
-			// If any form of networking is still working we should return nil so the
-			// agent doesn't shut down the entire subsystem, for example shutting
-			// down a functioning wifi access point when only bluetooth is broken,
-			// but still log that something is wrong.
-			n.logger.Warnw("Networking subsystem is partially unhealthy",
-				"wikiOk", wifiOk,
-				"bluetoothOk", btOk)
-		}
+	if bgLoopHealthy && mainLoopHealthy {
 		return nil
 	}
 	return networkingUnresponsiveError{
 		bgLoopHealthy:   bgLoopHealthy,
 		mainLoopHealthy: mainLoopHealthy,
-		btEnabled:       btEnabled,
-		btAdvUnset:      btAdvUnset,
-		btHealthy:       btHealthy,
 	}
 }
 
 type networkingUnresponsiveError struct {
 	bgLoopHealthy   bool
 	mainLoopHealthy bool
-	btEnabled       bool
-	btAdvUnset      bool
-	btHealthy       bool
 }
 
 func (e networkingUnresponsiveError) Error() string {
-	reasons := make([]string, 0, 4)
+	reasons := make([]string, 0, 2)
 	if !e.bgLoopHealthy {
 		reasons = append(reasons, "background loop unhealthy")
 	}
 	if !e.mainLoopHealthy {
 		reasons = append(reasons, "main loop unhealthy")
 	}
-	if e.btEnabled && !e.btAdvUnset && !e.btHealthy {
-		reasons = append(reasons, "bluetooth unhealthy")
-	}
-	return "networking system not responsive )" +
+	return "networking system not responsive (" +
 		strings.Join(reasons, ", ") +
 		")"
 }
@@ -428,7 +426,7 @@ func (n *Subsystem) processAdditionalnetworks(ctx context.Context) {
 	for _, network := range n.Nets() {
 		_, err := n.addOrUpdateConnection(network)
 		if err != nil {
-			n.logger.Warnw("error adding network", "err", err, "ssid", network.SSID)
+			n.logger.Warnw("error adding network", "err", err.Error(), "ssid", network.SSID)
 			continue
 		}
 		if network.Interface != "" {

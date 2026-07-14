@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/viamrobotics/agent"
 	"github.com/viamrobotics/agent/utils"
@@ -48,7 +49,7 @@ func main() {
 	} else if !inService {
 		globalLogger.Info("no service detected -- running as normal process")
 		utils.IsRunningLocally = true
-		commonMain()
+		commonMain(false)
 		return
 	}
 
@@ -63,8 +64,18 @@ func main() {
 		return
 	}
 
-	// send Agent logs to the Windows event viewer
-	logging.RegisterEventLogger(globalLogger, serviceName)
+	// Default to ETW for local logs, capturing the provider's events to a
+	// timestamped .etl file. Fall back to the Windows event viewer if the ETW
+	// session can't start.
+	etwCloser, etwErr := logging.RegisterETWLogger(globalLogger,
+		filepath.Join(utils.ViamDirs.Viam, "logs"), agent.AgentETW)
+	if etwErr != nil {
+		globalLogger.Warnf("failed to start ETW logger - using Event Logging for local logs: %s", etwErr)
+		logging.RegisterEventLogger(globalLogger, agent.AgentETW.ProviderName)
+	}
+	defer func() {
+		goutils.UncheckedError(etwCloser.Close())
+	}()
 
 	defer func() {
 		goutils.UncheckedError(elog.Close())
@@ -79,7 +90,7 @@ func main() {
 		}
 	}()
 
-	commonMain()
+	commonMain(true)
 
 	if _, err := zapChildren(context.Background()); err != nil {
 		goutils.UncheckedError(elog.Error(1, fmt.Sprintf("error killing subtree %s", err)))

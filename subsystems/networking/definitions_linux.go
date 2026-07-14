@@ -40,9 +40,12 @@ var (
 	ErrBadPassword             = errors.New("bad or missing password")
 	ErrConnCheckDisabled       = errors.New("NetworkManager connectivity checking disabled by user, network management will be unavailable")
 	ErrNoActiveConnectionFound = errors.New("no active connection found")
-	scanLoopDelay              = time.Second * 15
-	scanTimeout                = time.Second * 30
-	connectTimeout             = time.Second * 50 // longer than the 45 second timeout in NetworkManager
+	// ErrIPConfigUnavailable wraps a NetworkManager IpConfigUnavailable failure so the hotspot
+	// path can recognize it and emit an actionable hint (commonly a port 53 conflict).
+	ErrIPConfigUnavailable = errors.New("NetworkManager could not configure IP for the hotspot")
+	scanLoopDelay          = time.Second * 15
+	scanTimeout            = time.Second * 30
+	connectTimeout         = time.Second * 50 // longer than the 45 second timeout in NetworkManager
 )
 
 type lockingNetwork struct {
@@ -189,12 +192,13 @@ func (u *userInputData) sendInput(ctx context.Context) {
 	case u.inputChan <- *u.input:
 		u.connState.resetLastInteraction()
 		u.input = &userInput{}
+		u.connState.logger.Info("Provisioning credentials handed off to networking main loop")
 	case <-ctx.Done():
 		u.connState.logger.Warn("user input not received by main loop after 60 seconds")
 	}
 }
 
-func (u *userInputData) resetInputData(inputChan chan<- userInput) {
+func (u *userInputData) resetInputData() {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	if u.cancel != nil {
@@ -202,8 +206,6 @@ func (u *userInputData) resetInputData(inputChan chan<- userInput) {
 	}
 	u.workers.Wait()
 	u.cancel = nil
-	u.input = &userInput{}
-	u.inputChan = inputChan
 }
 
 type userInput struct {

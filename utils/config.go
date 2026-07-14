@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -18,6 +19,20 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
+const (
+	OSAutoUpgradeAll             = "all"
+	OSAutoUpgradeSecurity        = "security"
+	OSAutoUpgradeManagedAll      = "managed-all"
+	OSAutoUpgradeManagedSecurity = "managed-security"
+)
+
+var validOSAutoUpgradeTypes = []string{
+	OSAutoUpgradeAll,
+	OSAutoUpgradeSecurity,
+	OSAutoUpgradeManagedAll,
+	OSAutoUpgradeManagedSecurity,
+}
+
 var (
 	DefaultConfiguration = AgentConfig{
 		AdvancedSettings{
@@ -26,6 +41,7 @@ var (
 			DisableViamServer:             Tribool(0),
 			DisableNetworkConfiguration:   Tribool(0),
 			DisableSystemConfiguration:    Tribool(0),
+			DisableLogDeduplication:       Tribool(0),
 			ViamServerStartTimeoutMinutes: Timeout(time.Minute * 10),
 			ViamServerExtraEnvVars:        nil,
 		},
@@ -35,6 +51,7 @@ var (
 			LoggingJournaldStorage:                "persistent",
 			ForwardSystemLogs:                     "",
 			OSAutoUpgradeType:                     "",
+			OSManagedUpgradeIntervalHours:         24,
 		},
 		NetworkConfiguration{
 			Manufacturer:                        "viam",
@@ -131,6 +148,7 @@ type AdvancedSettings struct {
 	DisableViamServer             Tribool           `json:"disable_viam_server,omitempty"`
 	DisableNetworkConfiguration   Tribool           `json:"disable_network_configuration,omitempty"`
 	DisableSystemConfiguration    Tribool           `json:"disable_system_configuration,omitempty"`
+	DisableLogDeduplication       Tribool           `json:"disable_log_deduplication,omitempty"`
 	ViamServerStartTimeoutMinutes Timeout           `json:"viam_server_start_timeout_minutes,omitempty"`
 	ViamServerExtraEnvVars        map[string]string `json:"viam_server_env,omitempty"`
 }
@@ -153,7 +171,7 @@ func (as AdvancedSettings) GetDisableSystemConfiguration() bool {
 		return true
 	}
 
-	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+	if runtime.GOOS == "darwin" {
 		return true
 	}
 	return as.DisableSystemConfiguration.Get()
@@ -162,6 +180,11 @@ func (as AdvancedSettings) GetDisableSystemConfiguration() bool {
 // GetDisableViamServer is a wrapper which checks agent's advanced settings DisableViamServer field.
 func (as AdvancedSettings) GetDisableViamServer() bool {
 	return as.DisableViamServer.Get()
+}
+
+// GetDisableLogDeduplication is a wrapper which checks agent's advanced settings DisableLogDeduplication field.
+func (as AdvancedSettings) GetDisableLogDeduplication() bool {
+	return as.DisableLogDeduplication.Get()
 }
 
 type SystemConfiguration struct {
@@ -181,9 +204,16 @@ type SystemConfiguration struct {
 	// UpgradeType can be
 	// Empty/missing ("") to make no changes
 	// "disable" (or "disabled") to disable auto-upgrades
-	// "security" to enable ONLY security upgrades
-	// "all" to enable upgrades from all configured sources
+	// "security" to enable ONLY security upgrades via unattended-upgrades (OS-controlled schedule)
+	// "all" to enable upgrades from all configured sources via unattended-upgrades (OS-controlled schedule)
+	// "managed-security" to have the agent directly run security upgrades on a controlled schedule
+	// "managed-all" to have the agent directly run all upgrades on a controlled schedule
 	OSAutoUpgradeType string `json:"os_auto_upgrade_type,omitempty"`
+
+	// OSManagedUpgradeIntervalHours sets how often (in hours) the agent checks for and installs
+	// package updates when OSAutoUpgradeType is "managed-security" or "managed-all".
+	// Defaults to 24 hours. Must be >= 1.
+	OSManagedUpgradeIntervalHours float64 `json:"os_managed_upgrade_interval_hours,omitempty"`
 }
 
 type NetworkConfiguration struct {
@@ -413,15 +443,23 @@ func validateConfig(cfg AgentConfig) (AgentConfig, error) {
 		cfg.SystemConfiguration.LoggingJournaldStorage = defaultStorage
 	}
 
-	if cfg.SystemConfiguration.OSAutoUpgradeType != "" &&
-		cfg.SystemConfiguration.OSAutoUpgradeType != "security" &&
-		cfg.SystemConfiguration.OSAutoUpgradeType != "all" &&
-		cfg.SystemConfiguration.OSAutoUpgradeType != "disabled" &&
-		cfg.SystemConfiguration.OSAutoUpgradeType != "disable" {
+	if cfg.SystemConfiguration.OSAutoUpgradeType != "" && !slices.Contains(
+		slices.Concat(validOSAutoUpgradeTypes, []string{"disable", "disabled"}),
+		cfg.SystemConfiguration.OSAutoUpgradeType,
+	) {
 		errOut = errors.Join(errOut, errw.Errorf(
-			"agent.system_configuration.os_auto_upgrade_type can only be 'security' or 'all' (was: %s)",
+			"agent.system_configuration.os_auto_upgrade_type can only be 'security', 'all', 'managed-security', or 'managed-all' (was: %s)",
 			cfg.SystemConfiguration.OSAutoUpgradeType))
 		cfg.SystemConfiguration.OSAutoUpgradeType = DefaultConfiguration.SystemConfiguration.OSAutoUpgradeType
+	}
+
+	if cfg.SystemConfiguration.OSManagedUpgradeIntervalHours == 0 {
+		cfg.SystemConfiguration.OSManagedUpgradeIntervalHours = DefaultConfiguration.SystemConfiguration.OSManagedUpgradeIntervalHours
+	} else if cfg.SystemConfiguration.OSManagedUpgradeIntervalHours < 1 {
+		errOut = errors.Join(errOut, errw.Errorf(
+			"agent.system_configuration.os_managed_upgrade_interval_hours must be >= 1 (was: %g)",
+			cfg.SystemConfiguration.OSManagedUpgradeIntervalHours))
+		cfg.SystemConfiguration.OSManagedUpgradeIntervalHours = DefaultConfiguration.SystemConfiguration.OSManagedUpgradeIntervalHours
 	}
 
 	// NetworkConfiguration

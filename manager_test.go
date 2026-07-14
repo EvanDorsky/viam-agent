@@ -1,14 +1,105 @@
 package agent
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/viamrobotics/agent/subsystems/networking"
+	"github.com/viamrobotics/agent/subsystems/syscfg"
 	"github.com/viamrobotics/agent/utils"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/test"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
+
+// fakeViamServer is a test double for viamServerSubsystem. Each method's
+// behavior is controlled by an overridable func; defaults are inert.
+type fakeViamServer struct {
+	startFn          func(ctx context.Context) error
+	stopFn           func(ctx context.Context) error
+	updateFn         func(ctx context.Context, cfg utils.AgentConfig) bool
+	restartAllowedFn func(ctx context.Context) bool
+
+	startCalls int
+	stopCalls  int
+}
+
+func (f *fakeViamServer) Start(ctx context.Context) error {
+	f.startCalls++
+	if f.startFn != nil {
+		return f.startFn(ctx)
+	}
+	return nil
+}
+
+func (f *fakeViamServer) Stop(ctx context.Context) error {
+	f.stopCalls++
+	if f.stopFn != nil {
+		return f.stopFn(ctx)
+	}
+	return nil
+}
+
+func (f *fakeViamServer) Update(ctx context.Context, cfg utils.AgentConfig) bool {
+	if f.updateFn != nil {
+		return f.updateFn(ctx, cfg)
+	}
+	return false
+}
+
+func (f *fakeViamServer) RestartAllowed(ctx context.Context) bool {
+	if f.restartAllowedFn != nil {
+		return f.restartAllowedFn(ctx)
+	}
+	return true
+}
+
+func (f *fakeViamServer) DoesNotHandleNeedsRestart() bool { return true }
+func (f *fakeViamServer) MarkAppTriggeredRestart()        {}
+func (f *fakeViamServer) Uptime() *durationpb.Duration    { return nil }
+
+func TestApplyLogDeduplication(t *testing.T) {
+	newManager := func(t *testing.T) (*Manager, *logging.Registry) {
+		t.Helper()
+		logger, registry := logging.NewLoggerWithRegistry("test")
+		logger.AddAppender(logging.NewTestAppender(t))
+		return &Manager{logger: logger, registry: registry}, registry
+	}
+
+	t.Run("enabled by default", func(t *testing.T) {
+		m, registry := newManager(t)
+		// Registry starts with deduplication disabled.
+		test.That(t, registry.DeduplicateLogs.Load(), test.ShouldBeFalse)
+
+		// Default config does not disable deduplication, so it should be enabled.
+		m.applyLogDeduplication(utils.DefaultConfig())
+		test.That(t, registry.DeduplicateLogs.Load(), test.ShouldBeTrue)
+	})
+
+	t.Run("disabled when configured", func(t *testing.T) {
+		m, registry := newManager(t)
+
+		cfg := utils.DefaultConfig()
+		cfg.AdvancedSettings.DisableLogDeduplication = 1
+		m.applyLogDeduplication(cfg)
+		test.That(t, registry.DeduplicateLogs.Load(), test.ShouldBeFalse)
+
+		// Re-enabling via a subsequent config update flips it back on.
+		cfg.AdvancedSettings.DisableLogDeduplication = -1
+		m.applyLogDeduplication(cfg)
+		test.That(t, registry.DeduplicateLogs.Load(), test.ShouldBeTrue)
+	})
+
+	t.Run("nil registry is a no-op", func(t *testing.T) {
+		m := &Manager{logger: logging.NewTestLogger(t)}
+		// Should not panic.
+		m.applyLogDeduplication(utils.DefaultConfig())
+	})
+}
 
 func TestLoadAppConfig(t *testing.T) {
 	// Helper to create a minimal manager for testing
@@ -238,4 +329,175 @@ func TestLoadAppConfig(t *testing.T) {
 		test.That(t, err, test.ShouldNotBeNil)
 		test.That(t, err.Error(), test.ShouldContainSubstring, "field 'key' in 'api_key' must be a non-empty string")
 	})
+}
+
+// TestSubsystemUpdatesViamServerRestart covers the viam-server restart block
+// in SubsystemUpdates: the outer trigger (needRestart/configChange/agent/server
+// flags), the RestartAllowed gate, Stop outcome handling, and the
+// viamAgentNeedsRestart → Exit escape.
+//
+// Note on the viamServerNeedsRestart invariant: the flag tracks viam-server
+// signals only (binary update or config change). Agent-only triggers
+// (viamAgentNeedsRestart) never set it, even when Stop fails or RestartAllowed
+// denies — those rows expect the flag to stay false.
+func TestSubsystemUpdatesViamServerRestart(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		updateReturns     bool
+		initialAgentFlag  bool
+		restartNotAllowed bool
+		stopErr           error
+
+		wantStopCalls      int
+		wantStartCalls     int
+		wantViamServerFlag bool
+		wantExitCalled     bool
+	}{
+		{
+			name:           "no trigger; skip restart block",
+			wantStopCalls:  0,
+			wantStartCalls: 1,
+		},
+		{
+			name:           "config change triggers; stop ok; flag cleared",
+			updateReturns:  true,
+			wantStopCalls:  1,
+			wantStartCalls: 1,
+		},
+		{
+			name:               "config change triggers; stop fails; flag set",
+			updateReturns:      true,
+			stopErr:            errors.New("stop failed"),
+			wantStopCalls:      1,
+			wantStartCalls:     1,
+			wantViamServerFlag: true,
+		},
+		{
+			name:               "config change triggers; restart not allowed; flag set, no stop",
+			updateReturns:      true,
+			restartNotAllowed:  true,
+			wantStopCalls:      0,
+			wantStartCalls:     1,
+			wantViamServerFlag: true,
+		},
+		{
+			name:             "agent restart pending; stop ok; exits without starting",
+			initialAgentFlag: true,
+			wantStopCalls:    1,
+			wantStartCalls:   0,
+			wantExitCalled:   true,
+		},
+		{
+			name:             "agent restart pending; stop fails; exits anyway",
+			initialAgentFlag: true,
+			stopErr:          errors.New("stop failed"),
+			wantStopCalls:    1,
+			wantStartCalls:   0,
+			wantExitCalled:   true,
+		},
+		{
+			name:              "agent restart pending; restart not allowed; no exit",
+			initialAgentFlag:  true,
+			restartNotAllowed: true,
+			wantStopCalls:     0,
+			wantStartCalls:    1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			utils.MockAndCreateViamDirs(t)
+			logger := logging.NewTestLogger(t)
+
+			ctx, cancelCtx := context.WithCancel(context.Background())
+			defer cancelCtx()
+
+			var exitCalled bool
+			globalCancel := func() {
+				exitCalled = true
+				cancelCtx()
+			}
+
+			cfg := utils.DefaultConfiguration
+			fake := &fakeViamServer{
+				updateFn:         func(context.Context, utils.AgentConfig) bool { return tc.updateReturns },
+				stopFn:           func(context.Context) error { return tc.stopErr },
+				restartAllowedFn: func(context.Context) bool { return !tc.restartNotAllowed },
+			}
+			m := &Manager{
+				logger:                logger,
+				cfg:                   cfg,
+				globalCancel:          globalCancel,
+				viamServer:            fake,
+				networking:            networking.New(ctx, logger, cfg),
+				cache:                 NewVersionCache(logger),
+				agentStartTime:        time.Now(),
+				viamAgentNeedsRestart: tc.initialAgentFlag,
+			}
+			m.sysConfig = syscfg.New(ctx, logger, cfg, m.GetNetAppender, false, fake.RestartAllowed)
+
+			m.SubsystemUpdates(ctx)
+
+			test.That(t, fake.stopCalls, test.ShouldEqual, tc.wantStopCalls)
+			test.That(t, fake.startCalls, test.ShouldEqual, tc.wantStartCalls)
+			test.That(t, m.viamServerNeedsRestart, test.ShouldEqual, tc.wantViamServerFlag)
+			test.That(t, exitCalled, test.ShouldEqual, tc.wantExitCalled)
+		})
+	}
+}
+
+// TestSubsystemUpdatesMarksRunningVersion verifies that SubsystemUpdates calls
+// MarkViamServerRunningVersion whenever it is about to Start viam-server at
+// the installed CurrentVersion — i.e., when no restart is pending at the
+// point of Start. Mark reflects the decision to run a version, not
+// confirmation of a healthy start; it is skipped only when the old version
+// is still running (Stop failed or restart was disallowed).
+func TestSubsystemUpdatesMarksRunningVersion(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		updateReturns     bool
+		stopErr           error
+		restartNotAllowed bool
+		wantMark          bool
+	}{
+		{name: "no restart triggered; marks running", wantMark: true},
+		{name: "restart succeeds; marks running", updateReturns: true, wantMark: true},
+		{name: "restart stop fails; no mark", updateReturns: true, stopErr: errors.New("stop failed"), wantMark: false},
+		{name: "restart not allowed; no mark", updateReturns: true, restartNotAllowed: true, wantMark: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			utils.MockAndCreateViamDirs(t)
+			logger := logging.NewTestLogger(t)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			cfg := utils.DefaultConfiguration
+			fake := &fakeViamServer{
+				updateFn:         func(context.Context, utils.AgentConfig) bool { return tc.updateReturns },
+				stopFn:           func(context.Context) error { return tc.stopErr },
+				restartAllowedFn: func(context.Context) bool { return !tc.restartNotAllowed },
+			}
+			m := &Manager{
+				logger:         logger,
+				cfg:            cfg,
+				globalCancel:   cancel,
+				viamServer:     fake,
+				networking:     networking.New(ctx, logger, cfg),
+				cache:          NewVersionCache(logger),
+				agentStartTime: time.Now(),
+			}
+			m.sysConfig = syscfg.New(ctx, logger, cfg, m.GetNetAppender, false, nil)
+
+			// Seed CurrentVersion so we can detect whether Mark copied it.
+			m.cache.ViamServer.CurrentVersion = "0.70.0"
+			test.That(t, m.cache.ViamServerRunningVersion(), test.ShouldEqual, "")
+
+			m.SubsystemUpdates(ctx)
+
+			want := ""
+			if tc.wantMark {
+				want = "0.70.0"
+			}
+			test.That(t, m.cache.ViamServerRunningVersion(), test.ShouldEqual, want)
+		})
+	}
 }

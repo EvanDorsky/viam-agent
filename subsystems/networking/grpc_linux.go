@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"syscall"
 
 	errw "github.com/pkg/errors"
 	"github.com/viamrobotics/agent/utils"
@@ -18,13 +19,19 @@ func (n *Subsystem) startGRPC(bindAddr string, bindPort int) error {
 	//nolint: noctx
 	lis, err := net.Listen("tcp", bind)
 	if err != nil {
+		if errors.Is(err, syscall.EADDRINUSE) {
+			return errw.Wrapf(err, "cannot bind %s: another service is already using this port. "+
+				"Stop it or scope its listen address away from %s (find it with: ss -ltnp | grep :%d)",
+				bind, bindAddr, bindPort)
+		}
 		return errw.Wrapf(err, "listening on: %s", bind)
 	}
 
+	srv := grpc.NewServer(grpc.WaitForHandlers(true))
 	n.dataMu.Lock()
-	n.grpcServer = grpc.NewServer(grpc.WaitForHandlers(true))
+	n.grpcServer = srv
 	n.dataMu.Unlock()
-	pb.RegisterProvisioningServiceServer(n.grpcServer, n)
+	pb.RegisterProvisioningServiceServer(srv, n)
 
 	n.portalData.workers.Add(1)
 	go func() {
@@ -36,7 +43,7 @@ func (n *Subsystem) startGRPC(bindAddr string, bindPort int) error {
 			}
 		})
 		defer n.portalData.workers.Done()
-		if err := n.grpcServer.Serve(lis); err != nil {
+		if err := srv.Serve(lis); err != nil {
 			n.logger.Warn(err)
 		}
 	}()
